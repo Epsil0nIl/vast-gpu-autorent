@@ -18,6 +18,8 @@ bootstrap_timeout_s = 600
 verified_only = true
 min_reliability = 0.95
 log_tail_lines = 500
+# Relative to the directory you run from. Use an absolute path if more than one
+# process or working directory should share a single lease.
 state_dir = "./state"
 # Optional. Sent to the instance as RENT_CALLBACK_URL when non-empty.
 callback_base_url = ""

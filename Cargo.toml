@@ -2,6 +2,7 @@
 name = "vast-gpu-autorent"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Rent the cheapest on-demand Vast.ai GPU under an hourly price cap"
 license = "MIT"
 readme = "README.md"

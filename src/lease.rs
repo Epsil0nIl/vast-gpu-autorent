@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -9,6 +10,7 @@ use chrono::{DateTime, Utc};
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 
+pub const STATUS_INTENT: &str = "intent";
 pub const STATUS_PROVISIONING: &str = "provisioning";
 pub const STATUS_DESTROY_FAILED: &str = "destroy_failed";
 
@@ -16,7 +18,11 @@ pub const STATUS_DESTROY_FAILED: &str = "destroy_failed";
 pub struct LeaseRecord {
     pub profile: String,
     pub lease_id: String,
-    pub instance_id: u64,
+    /// Vast label sent with the create call. Reconciliation uses it when the response is lost.
+    #[serde(default)]
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<u64>,
     pub offer_id: u64,
     pub gpu_name: Option<String>,
     pub geolocation: Option<String>,
@@ -114,9 +120,24 @@ impl LeaseGuard {
         }
         let tmp = temp_path(&self.path);
         let body = serde_json::to_vec_pretty(leases).context("encoding lease file")?;
-        fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .with_context(|| format!("opening {}", tmp.display()))?;
+        file.write_all(&body)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("flushing {}", tmp.display()))?;
+        drop(file);
         fs::rename(&tmp, &self.path)
             .with_context(|| format!("replacing {} with {}", self.path.display(), tmp.display()))?;
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 }
@@ -152,7 +173,8 @@ mod tests {
         LeaseRecord {
             profile: "gpu".to_string(),
             lease_id: "lease-1".to_string(),
-            instance_id: 9,
+            label: "gpu-lease-1".to_string(),
+            instance_id: Some(9),
             offer_id: 3,
             gpu_name: Some("RTX 3090".to_string()),
             geolocation: None,
@@ -173,7 +195,7 @@ mod tests {
         let store = LeaseStore::new(dir.join("leases.json"));
         let guard = store.lock_blocking().unwrap();
         guard.upsert(record()).unwrap();
-        assert_eq!(guard.get("gpu").unwrap().unwrap().instance_id, 9);
+        assert_eq!(guard.get("gpu").unwrap().unwrap().instance_id, Some(9));
         guard.remove("gpu").unwrap();
         assert!(guard.get("gpu").unwrap().is_none());
         drop(guard);
@@ -182,6 +204,17 @@ mod tests {
 
     #[test]
     fn a_second_process_cannot_take_the_lock() {
+        let available = std::process::Command::new("flock")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !available {
+            eprintln!("skipping lock test: flock is not installed");
+            return;
+        }
         let dir =
             std::env::temp_dir().join(format!("vast-gpu-autorent-lock-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();

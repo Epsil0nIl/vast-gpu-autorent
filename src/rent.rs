@@ -9,11 +9,11 @@ use crate::{
     config::AppConfig,
     lease::{
         runtime_exceeded, LeaseGuard, LeaseRecord, LeaseStore, STATUS_DESTROY_FAILED,
-        STATUS_PROVISIONING,
+        STATUS_INTENT, STATUS_PROVISIONING,
     },
     select::{
-        build_create_request, geolocation_api_code, is_stale_offer_error, offer_in_region,
-        ranked_offers,
+        build_create_request, geolocation_api_code, instance_label, is_stale_offer_error,
+        offer_in_region, ranked_offers,
     },
     types::VastInstance,
     VastOffer,
@@ -48,7 +48,7 @@ impl Renter {
         let profile = self.config.profile(profile_name)?;
         let runtime = match self.config.vast.max_runtime_hours {
             Some(hours) => format!(
-                "Instances older than {hours} hours are destroyed on the next rent, status, or destroy."
+                "max_runtime_hours is {hours}. The next rent, status, destroy, or logs destroys an older instance. This program does not keep running after it exits, so that is not an automatic deadline."
             ),
             None => "Runtime is not capped. Destroy the instance when you are done. A stopped instance can keep accruing storage charges.".to_string(),
         };
@@ -69,14 +69,16 @@ impl Renter {
     pub async fn rent(&self, profile_name: &str, force_replace: bool) -> Result<RentOutcome> {
         let profile = self.config.profile(profile_name)?.clone();
         let guard = self.leases.exclusive().await?;
-        if let Some(existing) = self.reconcile(&guard, profile_name).await?.lease {
+        if let Some(existing) = self.reconcile(&guard, profile_name, false).await?.lease {
             if existing.status == STATUS_DESTROY_FAILED && !force_replace {
                 bail!(
                     "instance {} is still billed after a failed destroy. Run destroy, or pass --force-replace to retry it. A new instance was not created.",
-                    existing.instance_id
+                    recorded_id(&existing)?
                 );
             }
-            if !force_replace && existing.status == STATUS_PROVISIONING {
+            if !force_replace
+                && (existing.status == STATUS_PROVISIONING || existing.status == STATUS_INTENT)
+            {
                 return self
                     .finish_provisioning(&guard, existing, profile_name, true)
                     .await;
@@ -88,27 +90,44 @@ impl Renter {
                     lease: existing,
                 });
             }
+            let existing_id = recorded_id(&existing)?;
             self.destroy_recorded(&guard, &existing)
                 .await
                 .with_context(|| {
                     format!(
-                        "refusing to rent a replacement while instance {} still exists",
-                        existing.instance_id
+                        "refusing to rent a replacement while instance {existing_id} still exists"
                     )
                 })?;
         }
 
         let lease_id = Uuid::new_v4().to_string();
+        let mut lease = LeaseRecord {
+            profile: profile_name.to_string(),
+            lease_id: lease_id.clone(),
+            label: instance_label(&profile.label_prefix, &lease_id),
+            instance_id: None,
+            offer_id: 0,
+            gpu_name: None,
+            geolocation: None,
+            host: None,
+            ssh_port: None,
+            public_ip: None,
+            hourly_price_usd: 0.0,
+            status: STATUS_INTENT.to_string(),
+            created_at: Utc::now(),
+        };
+        guard.upsert(lease.clone())?;
         let create_request =
             build_create_request(&self.config.vast, &profile, profile_name, &lease_id)?;
         let machine_constraint = self.machine_constraint(&profile).await?;
         let mut rejected_offer_ids = HashSet::new();
         let mut last_create_error = None;
-        let (instance_id, offer) = loop {
+        loop {
             let offers = self
                 .matching_offers(&profile, machine_constraint, &rejected_offer_ids)
                 .await?;
             let Some(selected) = offers.into_iter().next() else {
+                guard.remove(profile_name)?;
                 if let Some(error) = last_create_error.as_ref() {
                     bail!(
                         "no valid Vast offers found for profile {profile_name} after rejecting stale offers: {error:#}"
@@ -121,55 +140,70 @@ impl Renter {
                 .create_instance(selected.id, &create_request)
                 .await
             {
-                Ok(created_instance_id) => break (created_instance_id, selected),
+                Ok(created_instance_id) => {
+                    lease.instance_id = Some(created_instance_id);
+                    lease.offer_id = selected.id;
+                    lease.gpu_name = selected.gpu_name.clone();
+                    lease.geolocation = selected.geolocation.clone();
+                    lease.hourly_price_usd = selected.dph_total;
+                    lease.status = STATUS_PROVISIONING.to_string();
+                    if let Err(error) = guard.upsert(lease.clone()) {
+                        return self
+                            .keep_or_destroy_after_save_failure(
+                                &guard,
+                                &lease,
+                                created_instance_id,
+                                error,
+                            )
+                            .await;
+                    }
+                    return self
+                        .finish_provisioning(&guard, lease, profile_name, false)
+                        .await;
+                }
                 Err(error) if is_stale_offer_error(&error) => {
                     rejected_offer_ids.insert(selected.id);
                     last_create_error = Some(error);
                 }
-                Err(error) => return Err(error),
+                Err(error) if VastClient::ambiguous_result(&error) => {
+                    bail!(
+                        "the create for label {} may have succeeded, but the response was lost ({error:#}). The local intent was kept. Run status before renting again. No second instance was created.",
+                        lease.label
+                    );
+                }
+                Err(error) => {
+                    guard.remove(profile_name)?;
+                    return Err(error);
+                }
             }
-        };
-
-        let lease = LeaseRecord {
-            profile: profile_name.to_string(),
-            lease_id,
-            instance_id,
-            offer_id: offer.id,
-            gpu_name: offer.gpu_name.clone(),
-            geolocation: offer.geolocation.clone(),
-            host: None,
-            ssh_port: None,
-            public_ip: None,
-            hourly_price_usd: offer.dph_total,
-            status: STATUS_PROVISIONING.to_string(),
-            created_at: Utc::now(),
-        };
-        if let Err(error) = guard.upsert(lease.clone()) {
-            return self.abandon_unrecorded(instance_id, error).await;
         }
-        self.finish_provisioning(&guard, lease, profile_name, false)
-            .await
     }
 
     pub async fn status(&self, profile_name: &str) -> Result<LeaseOutcome> {
         let guard = self.leases.exclusive().await?;
-        let reconciled = self.reconcile(&guard, profile_name).await?;
+        let reconciled = self.reconcile(&guard, profile_name, false).await?;
         Ok(LeaseOutcome {
             lease: reconciled.lease,
             message: reconciled.message,
         })
     }
 
-    pub async fn destroy(&self, profile_name: &str) -> Result<LeaseOutcome> {
+    pub async fn destroy(
+        &self,
+        profile_name: &str,
+        abandon_unresolved: bool,
+    ) -> Result<LeaseOutcome> {
         let guard = self.leases.exclusive().await?;
-        let reconciled = self.reconcile(&guard, profile_name).await?;
+        let reconciled = self
+            .reconcile(&guard, profile_name, abandon_unresolved)
+            .await?;
         let Some(active) = reconciled.lease else {
             return Ok(LeaseOutcome {
                 lease: None,
                 message: reconciled.message.or(Some("no local lease".to_string())),
             });
         };
-        let instance_id = active.instance_id;
+        let instance_id = recorded_id(&active)?;
         self.destroy_recorded(&guard, &active).await?;
         Ok(LeaseOutcome {
             lease: Some(active),
@@ -179,13 +213,13 @@ impl Renter {
 
     pub async fn logs(&self, profile_name: &str) -> Result<crate::VastLogsResponse> {
         let guard = self.leases.exclusive().await?;
-        let reconciled = self.reconcile(&guard, profile_name).await?;
+        let reconciled = self.reconcile(&guard, profile_name, false).await?;
         let active = reconciled.lease.with_context(|| {
             reconciled
                 .message
                 .unwrap_or_else(|| format!("no local lease for profile {profile_name}"))
         })?;
-        self.client.request_logs(active.instance_id).await
+        self.client.request_logs(recorded_id(&active)?).await
     }
 
     async fn matching_offers(
@@ -248,15 +282,35 @@ impl Renter {
             .map(|constraint| constraint.machine_id))
     }
 
-    async fn reconcile(&self, guard: &LeaseGuard, profile_name: &str) -> Result<Reconciled> {
+    async fn reconcile(
+        &self,
+        guard: &LeaseGuard,
+        profile_name: &str,
+        abandon_unresolved: bool,
+    ) -> Result<Reconciled> {
         let Some(mut lease) = guard.get(profile_name)? else {
             return Ok(Reconciled {
                 lease: None,
                 message: None,
             });
         };
+        if lease.instance_id.is_none() || lease.status == STATUS_INTENT {
+            let Some(resolved) = self
+                .resolve_intent(guard, lease, abandon_unresolved)
+                .await?
+            else {
+                return Ok(Reconciled {
+                    lease: None,
+                    message: Some(
+                        "cleared an unresolved create after Vast's listing did not show its label. Check the console before renting again; a delayed listing can still be wrong."
+                            .to_string(),
+                    ),
+                });
+            };
+            lease = resolved;
+        }
+        let instance_id = recorded_id(&lease)?;
         if self.runtime_is_over(&lease) {
-            let instance_id = lease.instance_id;
             self.destroy_recorded(guard, &lease)
                 .await
                 .with_context(|| {
@@ -267,14 +321,13 @@ impl Renter {
             return Ok(Reconciled {
                 lease: None,
                 message: Some(format!(
-                    "destroyed instance {instance_id} because it exceeded max_runtime_hours"
+                    "destroyed instance {instance_id} because it exceeded max_runtime_hours on this command. This is not a background timer."
                 )),
             });
         }
         if lease.status == STATUS_DESTROY_FAILED {
-            match self.client.destroy_instance(lease.instance_id).await {
+            match self.client.destroy_instance(instance_id).await {
                 Ok(()) => {
-                    let instance_id = lease.instance_id;
                     guard.remove(profile_name)?;
                     return Ok(Reconciled {
                         lease: None,
@@ -284,7 +337,6 @@ impl Renter {
                     });
                 }
                 Err(error) if VastClient::missing_instance(&error) => {
-                    let instance_id = lease.instance_id;
                     guard.remove(profile_name)?;
                     return Ok(Reconciled {
                         lease: None,
@@ -302,7 +354,7 @@ impl Renter {
             }
         }
 
-        match self.client.show_instance(lease.instance_id).await {
+        match self.client.show_instance(instance_id).await {
             Ok(instance) => {
                 apply_instance(&mut lease, &instance);
                 guard.upsert(lease.clone())?;
@@ -312,7 +364,6 @@ impl Renter {
                 })
             }
             Err(error) if VastClient::missing_instance(&error) => {
-                let instance_id = lease.instance_id;
                 guard.remove(profile_name)?;
                 Ok(Reconciled {
                     lease: None,
@@ -323,10 +374,63 @@ impl Renter {
             }
             Err(error) => Err(error).with_context(|| {
                 format!(
-                    "instance {} is recorded locally but Vast could not be queried. No second instance was created.",
-                    lease.instance_id
+                    "instance {instance_id} is recorded locally but Vast could not be queried. No second instance was created."
                 )
             }),
+        }
+    }
+
+    async fn resolve_intent(
+        &self,
+        guard: &LeaseGuard,
+        mut lease: LeaseRecord,
+        abandon_unresolved: bool,
+    ) -> Result<Option<LeaseRecord>> {
+        if lease.label.trim().is_empty() {
+            bail!(
+                "the local create intent for profile {} has no label, so it cannot be matched to a Vast instance. No new instance was created.",
+                lease.profile
+            );
+        }
+        let listed = self.client.list_instances().await.with_context(|| {
+            format!(
+                "could not list Vast instances while label {} is unresolved. No new instance was created.",
+                lease.label
+            )
+        })?;
+        let pairs = listed
+            .iter()
+            .map(|item| (item.id, item.label.as_deref()))
+            .collect::<Vec<_>>();
+        match match_instance_label(&lease.label, &pairs) {
+            LabelMatch::One(instance_id) => {
+                lease.instance_id = Some(instance_id);
+                if lease.status == STATUS_INTENT {
+                    lease.status = STATUS_PROVISIONING.to_string();
+                }
+                guard.upsert(lease.clone())?;
+                Ok(Some(lease))
+            }
+            LabelMatch::Many(ids) => {
+                bail!(
+                    "multiple Vast instances use label {}: {}. No new instance was created.",
+                    lease.label,
+                    ids.iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            LabelMatch::None if abandon_unresolved => {
+                guard.remove(&lease.profile)?;
+                Ok(None)
+            }
+            LabelMatch::None => {
+                bail!(
+                    "no instance with label {} is visible. An empty Vast listing is not proof the create failed. No new instance was created. If the console has no instance with that label, run destroy --abandon-unresolved.",
+                    lease.label
+                );
+            }
         }
     }
 
@@ -344,12 +448,24 @@ impl Renter {
         profile_name: &str,
         resumed: bool,
     ) -> Result<RentOutcome> {
+        let instance_id = recorded_id(&lease)?;
         match self
             .client
-            .wait_for_instance_ready(lease.instance_id, profile_name)
+            .wait_for_instance_ready(instance_id, profile_name)
             .await
         {
             Ok(instance) => {
+                if let Some(price) = instance.dph_total {
+                    let cap = self.config.vast.max_hourly_price_usd;
+                    if price > cap + 0.000_1 {
+                        let note = self
+                            .destroy_after_failure(guard, &mut lease, instance_id)
+                            .await;
+                        bail!(
+                            "Vast reported ${price:.4}/hr for instance {instance_id}, above the ${cap:.4}/hr cap. {note}"
+                        );
+                    }
+                }
                 apply_instance(&mut lease, &instance);
                 lease.status = instance
                     .actual_status
@@ -364,41 +480,52 @@ impl Renter {
                 })
             }
             Err(error) => {
-                let logs = self.client.request_logs(lease.instance_id).await.ok();
+                let logs = self.client.request_logs(instance_id).await.ok();
                 let log_url = logs.and_then(|logs| logs.result_url).unwrap_or_default();
-                let destroy_note = match self.client.destroy_instance(lease.instance_id).await {
-                    Ok(()) => {
-                        guard.remove(&lease.profile)?;
-                        "destroyed the instance that failed to become ready".to_string()
-                    }
-                    Err(destroy_error) if VastClient::missing_instance(&destroy_error) => {
-                        guard.remove(&lease.profile)?;
-                        "the instance was already gone".to_string()
-                    }
-                    Err(destroy_error) => {
-                        lease.status = STATUS_DESTROY_FAILED.to_string();
-                        guard.upsert(lease.clone()).with_context(|| {
-                            format!(
-                                "instance {} is still billed and the lease file could not record the failed destroy",
-                                lease.instance_id
-                            )
-                        })?;
-                        format!(
-                            "could not destroy instance {}: {destroy_error:#}. The local lease was kept so the next command can retry.",
-                            lease.instance_id
-                        )
-                    }
-                };
+                let destroy_note = self
+                    .destroy_after_failure(guard, &mut lease, instance_id)
+                    .await;
                 Err(anyhow!(
-                    "vast instance {} failed to become ready: {error:#}. {destroy_note}. logs: {log_url}",
-                    lease.instance_id
+                    "vast instance {instance_id} failed to become ready: {error:#}. {destroy_note}. logs: {log_url}"
                 ))
             }
         }
     }
 
+    async fn destroy_after_failure(
+        &self,
+        guard: &LeaseGuard,
+        lease: &mut LeaseRecord,
+        instance_id: u64,
+    ) -> String {
+        match self.client.destroy_instance(instance_id).await {
+            Ok(()) => {
+                let _ = guard.remove(&lease.profile);
+                "destroyed the instance".to_string()
+            }
+            Err(destroy_error) if VastClient::missing_instance(&destroy_error) => {
+                let _ = guard.remove(&lease.profile);
+                "the instance was already gone".to_string()
+            }
+            Err(destroy_error) => {
+                lease.instance_id = Some(instance_id);
+                lease.status = STATUS_DESTROY_FAILED.to_string();
+                if guard.upsert(lease.clone()).is_err() {
+                    format!(
+                        "could not destroy instance {instance_id} ({destroy_error:#}) and could not update the lease file. Destroy it in the Vast console."
+                    )
+                } else {
+                    format!(
+                        "could not destroy instance {instance_id}: {destroy_error:#}. The local lease was kept so the next command can retry."
+                    )
+                }
+            }
+        }
+    }
+
     async fn destroy_recorded(&self, guard: &LeaseGuard, active: &LeaseRecord) -> Result<()> {
-        match self.client.destroy_instance(active.instance_id).await {
+        let instance_id = recorded_id(active)?;
+        match self.client.destroy_instance(instance_id).await {
             Ok(()) => {
                 guard.remove(&active.profile)?;
                 Ok(())
@@ -413,8 +540,7 @@ impl Renter {
                 let destroy_message = format!("{error:#}");
                 guard.upsert(failed).with_context(|| {
                     format!(
-                        "instance {} could not be destroyed ({destroy_message}) and the lease file could not record it",
-                        active.instance_id
+                        "instance {instance_id} could not be destroyed ({destroy_message}) and the lease file could not record it"
                     )
                 })?;
                 Err(error)
@@ -422,24 +548,61 @@ impl Renter {
         }
     }
 
-    async fn abandon_unrecorded(
+    async fn keep_or_destroy_after_save_failure(
         &self,
+        guard: &LeaseGuard,
+        lease: &LeaseRecord,
         instance_id: u64,
         write_error: anyhow::Error,
     ) -> Result<RentOutcome> {
         match self.client.destroy_instance(instance_id).await {
-            Ok(()) => Err(write_error.context(format!(
-                "destroyed instance {instance_id} because the lease file could not be written"
-            ))),
-            Err(destroy_error) if VastClient::missing_instance(&destroy_error) => {
+            Ok(()) => {
+                let _ = guard.remove(&lease.profile);
                 Err(write_error.context(format!(
-                    "instance {instance_id} was already gone and the lease file could not be written"
+                    "destroyed instance {instance_id} because the provisioning record could not be written. Label {} remains the thing to look for if the destroy did not stick.",
+                    lease.label
+                )))
+            }
+            Err(destroy_error) if VastClient::missing_instance(&destroy_error) => {
+                let _ = guard.remove(&lease.profile);
+                Err(write_error.context(format!(
+                    "instance {instance_id} was already gone and the provisioning record could not be written"
                 )))
             }
             Err(destroy_error) => Err(anyhow!(
-                "created Vast instance {instance_id} but could not write the lease file ({write_error:#}) and could not destroy it ({destroy_error:#}). Destroy instance {instance_id} in the Vast console before renting again."
+                "created Vast instance {instance_id} with label {} but could not record the id ({write_error:#}) and could not destroy it ({destroy_error:#}). The create intent was kept. Run status before renting again.",
+                lease.label
             )),
         }
+    }
+}
+
+fn recorded_id(lease: &LeaseRecord) -> Result<u64> {
+    lease.instance_id.with_context(|| {
+        format!(
+            "lease {} ({}) has no Vast instance id",
+            lease.lease_id, lease.label
+        )
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LabelMatch {
+    One(u64),
+    None,
+    Many(Vec<u64>),
+}
+
+pub(crate) fn match_instance_label(label: &str, instances: &[(u64, Option<&str>)]) -> LabelMatch {
+    let ids = instances
+        .iter()
+        .filter(|(_, instance_label)| instance_label.as_deref() == Some(label))
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    match ids.len() {
+        0 => LabelMatch::None,
+        1 => LabelMatch::One(ids[0]),
+        _ => LabelMatch::Many(ids),
     }
 }
 
@@ -483,4 +646,27 @@ struct Reconciled {
 pub struct LeaseOutcome {
     pub lease: Option<LeaseRecord>,
     pub message: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_match_does_not_treat_a_missing_list_as_a_different_instance() {
+        let instances = [(7, Some("other-label")), (8, None)];
+        assert_eq!(
+            match_instance_label("gpu-lease", &instances),
+            LabelMatch::None
+        );
+        assert_eq!(
+            match_instance_label("other-label", &instances),
+            LabelMatch::One(7)
+        );
+        let duplicated = [(7, Some("gpu-lease")), (9, Some("gpu-lease"))];
+        assert_eq!(
+            match_instance_label("gpu-lease", &duplicated),
+            LabelMatch::Many(vec![7, 9])
+        );
+    }
 }

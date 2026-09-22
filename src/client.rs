@@ -1,6 +1,7 @@
+use std::fmt;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use reqwest::{Client, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -203,12 +204,24 @@ impl VastClient {
         }))
     }
 
+    pub async fn list_instances(&self) -> Result<Vec<ListedInstance>> {
+        let response: ListedInstancesEnvelope = self
+            .request(reqwest::Method::GET, "/instances/", Option::<&()>::None)
+            .await
+            .context("listing Vast instances")?;
+        Ok(response.instances.into_vec())
+    }
+
     pub fn missing_instance(error: &anyhow::Error) -> bool {
-        // Display/to_string() is only the outer context. The 404 is a source in the chain.
-        error.chain().any(|cause| {
-            let message = cause.to_string();
-            message.contains("404 Not Found") || message.contains("no_such_instance")
-        })
+        error
+            .chain()
+            .any(|cause| cause.downcast_ref::<MissingInstance>().is_some())
+    }
+
+    pub fn ambiguous_result(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .any(|cause| cause.downcast_ref::<AmbiguousApiResult>().is_some())
     }
 
     async fn request<B, T>(
@@ -231,20 +244,94 @@ impl VastClient {
         } else {
             request
         };
-        let response = request.send().await?;
+        let response = request.send().await.map_err(|error| {
+            anyhow!(AmbiguousApiResult {
+                detail: error.to_string(),
+            })
+        })?;
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
             bail!("Vast API rate-limited the request");
+        }
+        if response.status().is_server_error() || response.status() == StatusCode::REQUEST_TIMEOUT {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AmbiguousApiResult {
+                detail: format!("{status}: {body}"),
+            }
+            .into());
+        }
+        if response.status() == StatusCode::NOT_FOUND {
+            if let Some(instance_id) = instance_id_from_path(path) {
+                return Err(MissingInstance { instance_id }.into());
+            }
         }
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             bail!("Vast API request failed with {status}: {body}");
         }
-        response
-            .json()
-            .await
-            .context("failed to decode Vast API response")
+        let status = response.status();
+        let body = response.text().await.map_err(|error| {
+            anyhow!(AmbiguousApiResult {
+                detail: error.to_string(),
+            })
+        })?;
+        serde_json::from_str(&body).map_err(|error| {
+            anyhow!(AmbiguousApiResult {
+                detail: format!("failed to decode {status} response: {error}; body: {body}"),
+            })
+        })
     }
+}
+
+#[derive(Debug)]
+pub struct MissingInstance {
+    pub instance_id: u64,
+}
+
+impl fmt::Display for MissingInstance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Vast instance {} was not found",
+            self.instance_id
+        )
+    }
+}
+
+impl std::error::Error for MissingInstance {}
+
+#[derive(Debug)]
+pub struct AmbiguousApiResult {
+    pub detail: String,
+}
+
+impl fmt::Display for AmbiguousApiResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Vast result is ambiguous: {}", self.detail)
+    }
+}
+
+impl std::error::Error for AmbiguousApiResult {}
+
+fn instance_id_from_path(path: &str) -> Option<u64> {
+    let rest = path.trim_start_matches("/instances/").trim_end_matches('/');
+    if rest.is_empty() || !rest.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    rest.parse().ok()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListedInstance {
+    pub id: u64,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ListedInstancesEnvelope {
+    instances: OneOrMany<ListedInstance>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -335,19 +422,16 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn missing_instance_reads_the_error_chain() {
-        let error = anyhow::anyhow!(
-            "Vast API request failed with 404 Not Found: {{\"error\":\"no_such_instance\"}}"
-        )
-        .context("destroying Vast instance 15");
-        assert!(
-            !error.to_string().contains("404 Not Found"),
-            "outer Display must not be the only place we look, got {}",
-            error
-        );
+    fn missing_instance_is_typed_and_a_bare_404_is_not_enough() {
+        let error = anyhow::Error::from(MissingInstance { instance_id: 15 })
+            .context("destroying Vast instance 15");
         assert!(VastClient::missing_instance(&error));
-        let unrelated = anyhow::anyhow!("connection reset").context("destroying Vast instance 15");
-        assert!(!VastClient::missing_instance(&unrelated));
+        let other_404 = anyhow::anyhow!(
+            "Vast API request failed with 404 Not Found: {{\"error\":\"no_such_instance\"}}"
+        );
+        assert!(!VastClient::missing_instance(&other_404));
+        assert!(instance_id_from_path("/instances/15/").is_some());
+        assert!(instance_id_from_path("/instances/request_logs/15").is_none());
     }
 
     #[test]

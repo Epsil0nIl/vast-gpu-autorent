@@ -42,8 +42,7 @@ pub struct VastConfig {
     pub callback_base_url: String,
     #[serde(default)]
     pub bootstrap_token: String,
-    /// When set, reconcile destroys the instance after this many hours.
-    /// Bandwidth and any longer run are otherwise not covered by the hourly cap.
+    /// Checked on the next rent, status, destroy, or logs. Not a background timer.
     #[serde(default)]
     pub max_runtime_hours: Option<f64>,
 }
@@ -62,10 +61,26 @@ impl fmt::Debug for VastConfig {
             .field("min_reliability", &self.min_reliability)
             .field("log_tail_lines", &self.log_tail_lines)
             .field("state_dir", &self.state_dir)
-            .field("callback_base_url", &self.callback_base_url)
+            .field("callback_base_url", &redact_url(&self.callback_base_url))
             .field("bootstrap_token", &redact_secret(&self.bootstrap_token))
             .field("max_runtime_hours", &self.max_runtime_hours)
             .finish()
+    }
+}
+
+fn redact_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match Url::parse(trimmed) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.to_string()
+        }
+        Err(_) => "[redacted]".to_string(),
     }
 }
 
@@ -125,7 +140,7 @@ impl fmt::Debug for WorkerProfileConfig {
             .field("runtype", &self.runtype)
             .field("target_state", &self.target_state)
             .field("label_prefix", &self.label_prefix)
-            .field("onstart", &self.onstart)
+            .field("onstart", &crate::types::redact_if_present(&self.onstart))
             .field("env", &redacted_env(&self.env))
             .field("ports", &self.ports)
             .field("volume", &self.volume)
@@ -307,13 +322,20 @@ mod tests {
         let mut config: AppConfig = toml::from_str(include_str!("../config.example.toml")).unwrap();
         config.vast.api_key = "vast-live-key".to_string();
         config.vast.bootstrap_token = "launch-token".to_string();
-        config.profiles.get_mut("gpu").unwrap().env.insert(
-            "RENT_BOOTSTRAP_TOKEN".to_string(),
-            "launch-token".to_string(),
+        config.vast.callback_base_url =
+            "https://user:secret@callback.example/hook?token=abc".to_string();
+        let profile = config.profiles.get_mut("gpu").unwrap();
+        profile.env.insert(
+            "DATABASE_URL".to_string(),
+            "postgres://user:secret@db/app".to_string(),
         );
+        profile.onstart = "curl -H 'token: launch-token' https://example".to_string();
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("vast-live-key"));
         assert!(!rendered.contains("launch-token"));
+        assert!(!rendered.contains("postgres://user:secret"));
+        assert!(!rendered.contains("user:secret"));
+        assert!(!rendered.contains("token=abc"));
         assert!(rendered.contains("[redacted]"));
     }
 

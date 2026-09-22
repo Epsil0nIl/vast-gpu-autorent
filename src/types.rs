@@ -67,7 +67,7 @@ impl fmt::Debug for VastCreateInstanceRequest {
             .field("target_state", &self.target_state)
             .field("env", &redacted_env(&self.env))
             .field("cancel_unavail", &self.cancel_unavail)
-            .field("onstart", &self.onstart)
+            .field("onstart", &redact_if_present(&self.onstart))
             .field("price", &self.price)
             .field("volume_info", &self.volume_info)
             .finish()
@@ -77,30 +77,16 @@ impl fmt::Debug for VastCreateInstanceRequest {
 pub(crate) fn redacted_env(values: &HashMap<String, String>) -> HashMap<String, String> {
     values
         .iter()
-        .map(|(key, value)| {
-            let shown = if key_is_secret(key) && !value.is_empty() {
-                "[redacted]".to_string()
-            } else {
-                value.clone()
-            };
-            (key.clone(), shown)
-        })
+        .map(|(key, value)| (key.clone(), redact_if_present(value).to_string()))
         .collect()
 }
 
-pub(crate) fn key_is_secret(key: &str) -> bool {
-    let upper = key.to_ascii_uppercase();
-    [
-        "TOKEN",
-        "KEY",
-        "SECRET",
-        "PASSWORD",
-        "PASSWD",
-        "DSN",
-        "AUTHORIZATION",
-    ]
-    .iter()
-    .any(|needle| upper.contains(needle))
+pub(crate) fn redact_if_present(value: &str) -> &str {
+    if value.trim().is_empty() {
+        ""
+    } else {
+        "[redacted]"
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

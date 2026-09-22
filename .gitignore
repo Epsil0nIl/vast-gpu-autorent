@@ -1,3 +1,6 @@
 /target
 /state
 config.toml
+.env
+.env.*
+!.env.example

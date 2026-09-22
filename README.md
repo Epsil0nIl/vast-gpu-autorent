@@ -19,11 +19,11 @@ Use this when you want a small CLI to:
 - rent one machine, remember it, and avoid starting a second one by accident
 - destroy it when you are done, including after a crash or a failed startup
 
-The hourly cap is Vast's `dph_total` quote with your configured disk (`allocated_storage`) included. Bandwidth is billed separately. Runtime is not capped unless you set `max_runtime_hours`.
+The hourly cap is Vast's `dph_total` quote with your configured disk (`allocated_storage`) included. Bandwidth is billed separately. `max_runtime_hours` is checked only when you next run `rent`, `status`, `destroy`, or `logs`. It is not a background timer, and nothing is destroyed while this program is exited.
 
 ## Install
 
-You need Rust 1.80 or newer.
+You need Rust 1.85 or newer. The locked `uuid` 1.26.1 and `getrandom` 0.4.3 crates require it. A current stable toolchain is the safe choice. `Cargo.toml` sets `rust-version = "1.85"`.
 
 ```bash
 git clone https://github.com/Epsil0nIl/vast-gpu-autorent.git
@@ -58,9 +58,9 @@ Leave `vast.api_key` empty in the file. `config.toml` and `state/` are gitignore
 | `search` | Lists matching on-demand offers, cheapest valid offer first. Does not rent. |
 | `rent` | Creates one instance. Refuses if this profile already has a lease. |
 | `rent --force-replace` | Destroys the current instance, then rents another. |
-| `status` | Refreshes the recorded instance from Vast.ai. |
-| `destroy` | Deletes the Vast.ai instance and clears the local lease. |
-| `logs` | Asks Vast.ai for the instance log URL. |
+| `status` | Refreshes the recorded instance. Also runs cleanup: an expired `max_runtime_hours` or a failed destroy is retried here. |
+| `destroy` | Deletes the Vast.ai instance and clears the local lease. `--abandon-unresolved` clears a create whose response was lost only after Vast's instance list does not show its label. |
+| `logs` | Asks Vast.ai for the instance log URL, and runs the same cleanup as `status` first. |
 
 Flags: `--config path`, `--profile name`, `--limit N`.
 
@@ -72,13 +72,15 @@ Flags: `--config path`, `--profile name`, `--limit N`.
 4. If `preferred_geolocations` is set, each region is queried on its own, in order. The first region with a match wins, then the cheapest offer inside it. Names such as `Germany` are sent as Vast country codes (`DE`). One global page is only the fallback when every region query is empty.
 5. Equal price keeps the higher reliability score.
 6. Create uses `PUT /asks/{id}/`. If Vast says the offer is already gone (`410` / `no_such_instance` or `no_such_ask`), the next offer is tried.
-7. The instance id is written to `state/leases.json` before the ready wait. The next `rent`, `status`, or `destroy` reuses or destroys that instance instead of starting another one.
+7. A create intent, including the instance label, is written before the create request is sent. If the response is lost, the next command looks for that label and will not start a second instance while the result is unknown. An empty listing is not treated as proof the create failed. This is still not an atomic transaction with Vast: a lost response stays blocked until the label shows up, or you run `destroy --abandon-unresolved` after checking the console.
 8. Ready means Vast reports `running` and the SSH port accepts a TCP connection.
 9. A file lock covers the check, create, and save, so a second process waits.
 
 Vast measures `gpu_ram` in megabytes. A 24 GB floor is sent as `24576`. Published ports are sent as env keys `-p PORT:PORT=1`, which is the Vast create-instance convention.
 
-Set `max_runtime_hours` if you want the next `rent`, `status`, or `destroy` to tear the instance down after that many hours. A stopped instance can still accrue storage charges, so a machine that never becomes ready is destroyed instead of left stopped.
+Set `max_runtime_hours` if you want the next `rent`, `status`, `destroy`, or `logs` to tear the instance down after that many hours. Nothing keeps running after the command exits, so the instance is not destroyed at that hour unless one of those commands runs. A stopped instance can still accrue storage charges, so a machine that never becomes ready is destroyed instead of left stopped.
+
+`state_dir` is relative to the directory you launch from, unless you set an absolute path. Two working directories are two lease files, and the lock only covers one of them.
 
 ## Configuration
 
@@ -94,9 +96,10 @@ When set, the instance also receives `RENT_LEASE_ID`, `RENT_PROFILE`, `RENT_CALL
 ## Safety
 
 - `rent` creates a paid Vast.ai instance.
-- Do not commit `VAST_API_KEY`, `config.toml`, or `state/`.
+- Do not commit `VAST_API_KEY`, `config.toml`, `.env`, or `state/`.
 - Destroy the instance when you are done.
 - This tool does not cap bandwidth. The hourly number is not a total bill.
+- A lost create response is recovered by label. It is not a guarantee that Vast and the lease file always change together.
 
 ## Development
 

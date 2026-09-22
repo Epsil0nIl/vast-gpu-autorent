@@ -50,8 +50,17 @@ pub fn search_request(
 }
 
 /// Vast's geolocation filter takes a two-letter country code.
+pub fn instance_label(prefix: &str, lease_id: &str) -> String {
+    format!("{prefix}-{lease_id}")
+}
+
 pub fn geolocation_api_code(preferred: &str) -> String {
     let trimmed = preferred.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    // Check aliases before the two-letter fast path, or "UK" never becomes "GB".
+    if matches!(lower.as_str(), "uk" | "united kingdom" | "great britain") {
+        return "GB".to_string();
+    }
     if trimmed.len() == 2 && trimmed.chars().all(|ch| ch.is_ascii_alphabetic()) {
         return trimmed.to_ascii_uppercase();
     }
@@ -66,7 +75,6 @@ pub fn geolocation_api_code(preferred: &str) -> String {
         "poland" => "PL",
         "hungary" => "HU",
         "united states" | "united states of america" | "usa" => "US",
-        "united kingdom" | "uk" | "great britain" => "GB",
         "canada" => "CA",
         "sweden" => "SE",
         "norway" => "NO",
@@ -182,7 +190,7 @@ pub fn build_create_request(
         image: profile.image.clone(),
         template_hash_id: Some(profile.template_hash_id.clone())
             .filter(|value| !value.trim().is_empty()),
-        label: format!("{}-{}", profile.label_prefix, lease_id),
+        label: instance_label(&profile.label_prefix, lease_id),
         disk: profile.disk_gb,
         runtype: profile.runtype.clone(),
         target_state: profile.target_state.clone(),
@@ -272,17 +280,10 @@ fn preferred_geo_pool<'a>(
         if preferred.is_empty() {
             continue;
         }
-        let preferred_lower = preferred.to_ascii_lowercase();
         let tier = candidates
             .iter()
             .copied()
-            .filter(|offer| {
-                offer
-                    .geolocation
-                    .as_deref()
-                    .map(|geo| geo.to_ascii_lowercase().contains(&preferred_lower))
-                    .unwrap_or(false)
-            })
+            .filter(|offer| geo_matches(offer.geolocation.as_deref(), preferred))
             .collect::<Vec<_>>();
         if !tier.is_empty() {
             return tier;
@@ -493,10 +494,27 @@ mod tests {
     fn geolocation_query_uses_country_codes_and_does_not_substring_match_codes() {
         assert_eq!(geolocation_api_code("Germany"), "DE");
         assert_eq!(geolocation_api_code("de"), "DE");
+        assert_eq!(geolocation_api_code("UK"), "GB");
+        assert_eq!(geolocation_api_code("uk"), "GB");
         assert!(geo_matches(Some("Germany, DE"), "Germany"));
         assert!(geo_matches(Some("Germany, DE"), "DE"));
         assert!(!geo_matches(Some("China, CN"), "IN"));
         assert!(!geo_matches(Some("Finland, FI"), "IN"));
+    }
+
+    #[test]
+    fn selector_does_not_treat_in_as_letters_inside_another_country() {
+        let mut profile = profile();
+        profile.preferred_geolocations = vec!["IN".to_string()];
+        let mut china = offer(1, 0.10, 11);
+        china.geolocation = Some("China, CN".to_string());
+        let mut finland = offer(2, 0.11, 12);
+        finland.geolocation = Some("Finland, FI".to_string());
+        let mut india = offer(3, 0.20, 13);
+        india.geolocation = Some("India, IN".to_string());
+        let offers = [china, finland, india];
+        let selected = select_offer(&offers, &config(), &profile, None, &HashSet::new()).unwrap();
+        assert_eq!(selected.id, 3);
     }
 
     #[test]

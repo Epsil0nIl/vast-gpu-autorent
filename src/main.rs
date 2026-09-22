@@ -32,6 +32,7 @@ async fn run() -> Result<()> {
     let mut config_path = PathBuf::from("config.toml");
     let mut profile_name = None;
     let mut force_replace = false;
+    let mut abandon_unresolved = false;
     let mut limit = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -42,6 +43,7 @@ async fn run() -> Result<()> {
                 profile_name = Some(args.next().context("--profile needs a name")?);
             }
             "--force-replace" => force_replace = true,
+            "--abandon-unresolved" => abandon_unresolved = true,
             "--limit" => {
                 let raw = args.next().context("--limit needs a number")?;
                 limit = Some(
@@ -107,7 +109,7 @@ async fn run() -> Result<()> {
             print_lease(&outcome.lease);
         }
         "status" => print_outcome(&renter.status(&profile).await?),
-        "destroy" => print_outcome(&renter.destroy(&profile).await?),
+        "destroy" => print_outcome(&renter.destroy(&profile, abandon_unresolved).await?),
         "logs" => {
             let logs = renter.logs(&profile).await?;
             println!("success={}", logs.success);
@@ -135,7 +137,14 @@ fn print_outcome(outcome: &LeaseOutcome) {
 fn print_lease(lease: &LeaseRecord) {
     println!("profile={}", lease.profile);
     println!("lease_id={}", lease.lease_id);
-    println!("instance_id={}", lease.instance_id);
+    println!(
+        "instance_id={}",
+        lease
+            .instance_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+    println!("label={}", lease.label);
     println!("offer_id={}", lease.offer_id);
     println!("status={}", lease.status);
     println!("hourly_price_usd={:.4}", lease.hourly_price_usd);
@@ -161,14 +170,18 @@ fn usage() -> String {
 vast-gpu-autorent {version}
 Search Vast.ai for an on-demand GPU and rent the cheapest offer under your hourly cap.
 
-The cap includes the configured disk. It does not include bandwidth or, unless
-max_runtime_hours is set, how long the instance runs.
+The cap includes the configured disk. It does not include bandwidth.
+max_runtime_hours is checked on the next rent, status, destroy, or logs.
+It is not a background timer. Those commands can destroy an expired instance
+or retry a failed destroy.
+
+state_dir is relative to the directory you run from unless it is an absolute path.
 
 Usage:
   vast-gpu-autorent search  [--config path] [--profile name] [--limit N]
   vast-gpu-autorent rent    [--config path] [--profile name] [--force-replace]
   vast-gpu-autorent status  [--config path] [--profile name]
-  vast-gpu-autorent destroy [--config path] [--profile name]
+  vast-gpu-autorent destroy [--config path] [--profile name] [--abandon-unresolved]
   vast-gpu-autorent logs    [--config path] [--profile name]
 
 Config defaults to ./config.toml. Copy config.example.toml and export VAST_API_KEY.
