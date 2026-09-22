@@ -1,0 +1,57 @@
+# Copy to config.toml. Put the Vast API key in the environment:
+#   export VAST_API_KEY="..."
+# rent spends money on the account that owns that key. search does not.
+
+default_profile = "gpu"
+
+[vast]
+api_base_url = "https://console.vast.ai/api/v0"
+api_key = ""
+# Hourly cap on Vast's dph_total quote. The search sends disk_gb as allocated_storage,
+# so this price includes that disk. Bandwidth is extra. Runtime is not capped unless
+# max_runtime_hours is set.
+max_hourly_price_usd = 0.45
+# max_runtime_hours = 6
+search_limit = 50
+poll_interval_ms = 5000
+bootstrap_timeout_s = 600
+verified_only = true
+min_reliability = 0.95
+log_tail_lines = 500
+state_dir = "./state"
+# Optional. Sent to the instance as RENT_CALLBACK_URL when non-empty.
+callback_base_url = ""
+# Optional. Prefer the RENT_BOOTSTRAP_TOKEN environment variable.
+bootstrap_token = ""
+
+[profiles.gpu]
+min_gpu_ram_gb = 24
+gpu_count = 1
+min_reliability = 0.95
+direct_ports_required = true
+# Empty matches any GPU name. Otherwise an exact case-insensitive match.
+gpu_names = []
+# Empty picks the cheapest offer worldwide.
+# If set, the first region that has any match wins, then the cheapest offer in that region.
+preferred_geolocations = []
+image = "nvidia/cuda:12.4.1-base-ubuntu22.04"
+template_hash_id = ""
+disk_gb = 80
+runtype = "ssh_direct"
+target_state = "running"
+label_prefix = "gpu"
+# Optional shell command Vast runs after the instance boots.
+onstart = ""
+ports = []
+
+# [profiles.gpu.env]
+# MODEL_ID = "replace-me"
+
+# Attach a volume only if you already have one. volume_id and machine_id are yours.
+# [profiles.gpu.volume]
+# mount_path = "workspace-cache"
+# volume_id = 0
+# machine_id = 0
+# create_new = false
+# size_gb = 0
+# cache_subdir = "model-cache"

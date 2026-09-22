@@ -1,0 +1,28 @@
+[package]
+name = "vast-gpu-autorent"
+version = "0.1.0"
+edition = "2021"
+description = "Rent the cheapest on-demand Vast.ai GPU under an hourly price cap"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Epsil0nIl/vast-gpu-autorent"
+homepage = "https://cloud.vast.ai/?ref_id=710527"
+keywords = ["vast", "gpu", "cli", "cloud", "rental"]
+categories = ["command-line-utilities"]
+publish = false
+
+[[bin]]
+name = "vast-gpu-autorent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+fs4 = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.44", features = ["macros", "net", "rt-multi-thread", "time"] }
+toml = "0.8"
+url = "2.5"
+uuid = { version = "1.16", features = ["serde", "v4"] }
